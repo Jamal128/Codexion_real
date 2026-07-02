@@ -136,36 +136,65 @@ if (dongle_ready(first, coder->id, cooldown))
 else
 	wait_turn(second, first, coder);   // first es el bloqueante
 ```
+Sí. Yo reescribiría **toda la sección 4.4** para que refleje exactamente tu implementación actual y mantenga el mismo nivel de detalle que el resto del README.
 
-### 4.4 Prioridad: FIFO, EDF, y una historia de cómo un bug solo aparecía al ejecutar
+---
+
+## 4.4 Prioridad: FIFO y EDF
+
+Cada vez que un coder solicita sus dos dongles, se calcula una única prioridad que se inserta en **las dos colas de prioridad** (la del dongle izquierdo y la del derecho). Cada heap concede siempre el recurso al nodo con la prioridad más baja.
 
 ```c
 t_ms	calc_priority(t_coder *coder)
 {
+	t_ms	base_prio;
+
 	if (coder->codex->args.scheduler == FIFO)
-		base_prio = get_time_ms();                                    // orden de llegada
+		base_prio = get_time_ms();
 	else
-		base_prio = coder->last_compile + coder->codex->args.time_to_burnout; // deadline EDF
-	return (base_prio * 1000000 + (coder->id % 2) * 1000 + coder->id);
+		base_prio = coder->last_compile
+			+ coder->codex->args.time_to_burnout;
+	return (base_prio - coder->id);
 }
 ```
 
-Esta prioridad se inserta en las **dos** colas del coder (la del dongle izquierdo y la del derecho), y el heap de cada dongle siempre concede el dongle a quien tenga el valor **más bajo** (FIFO ⇒ el que más tiempo lleva esperando; EDF ⇒ el que tiene el deadline de quemado más cercano).
+La función solo decide **cómo se calcula la prioridad**; el heap es completamente independiente del algoritmo de planificación y únicamente compara valores numéricos.
 
-**El bug que solo se vio al correr el programa, no leyendo el código:** al arrancar la simulación, *todos* los coders tienen el mismo `last_compile` (el instante de inicio), así que en EDF todos arrancan con el **mismo deadline**. La primera versión desempataba ese empate por `id` puro (menor id gana siempre). Eso suena inocente, pero genera una **cascada total**: el coder 0 le gana a todos sus vecinos, así que el coder 1 nunca puede competir con él hasta que termine, el coder 2 nunca puede competir con el 1... el resultado es que con 8 coders, ¡toda la simulación se vuelve estrictamente secuencial al arrancar! Con `time_to_burnout` ajustado pero razonable, el último de la fila se quemaba antes de que le llegara el turno — **2 de cada 3 ejecuciones reales con 8 coders fallaban**, aunque el anillo en teoría permite que la mitad compile en paralelo.
+### FIFO (First In, First Out)
 
-La corrección: desempatar primero por **paridad** del id, y solo como último recurso por el id en sí (`(id % 2) * 1000 + id`). Con esto, en un empate, todos los coders de id par le ganan a sus vecinos impares y viceversa — es decir, se aproxima al 2-coloreado óptimo de un ciclo, que es exactamente lo que se necesita para que hasta `n/2` coders puedan compilar a la vez sin conflicto:
+En modo `fifo`, la prioridad es el instante en el que el coder registra su petición:
 
-```
-coder0(par) vs coder7(impar) → gana 0     coder0 vs coder1(impar) → gana 0   ⇒ coder0 compila YA
-coder2(par) vs coder1(impar) → gana 2     coder2 vs coder3(impar) → gana 2   ⇒ coder2 compila YA
-coder4(par) vs coder3(impar) → gana 4     coder4 vs coder5(impar) → gana 4   ⇒ coder4 compila YA
-coder6(par) vs coder5(impar) → gana 6     coder6 vs coder7(impar) → gana 6   ⇒ coder6 compila YA
+```text
+priority = request_time
 ```
 
-Confirmado en el log real tras el arreglo: los coders 1, 3, 5, 7 (display, 1-indexado) arrancan a compilar en el mismo milisegundo. Con `n` impar queda exactamente una "costura" en el anillo donde dos vecinos comparten paridad y se desempata por id puro — un cuello de botella muy localizado, nada comparable a la cascada total original.
+Como el heap es un **min-heap**, la solicitud con la marca temporal más antigua queda siempre en la raíz y obtiene el dongle antes que las que llegaron después, reproduciendo el comportamiento FIFO.
 
-Este truco **solo afecta a empates exactos**; en cuanto la simulación avanza un poco, cada coder tiene un `last_compile` distinto y el deadline real (la magnitud, multiplicada por `1 000 000`) domina sobre el desempate, así que EDF sigue siendo EDF de verdad.
+### EDF (Earliest Deadline First)
+
+En modo `edf`, la prioridad corresponde al instante absoluto en el que el coder agotaría su tiempo disponible si no comenzara una nueva compilación:
+
+```text
+priority = last_compile + time_to_burnout
+```
+
+Esto hace que quien tenga el *deadline* más cercano sea siempre quien reciba antes el recurso, implementando directamente la política **Earliest Deadline First** exigida por el enunciado.
+
+Como `last_compile` se actualiza cada vez que un coder empieza a compilar, su prioridad también cambia dinámicamente en cada nueva petición, reflejando siempre su margen real antes del burnout.
+
+### Desempate
+
+Puede ocurrir que dos coders registren su solicitud exactamente en el mismo milisegundo (FIFO) o que compartan el mismo *deadline* (EDF), especialmente al inicio de la simulación.
+
+Para garantizar un orden totalmente determinista, la prioridad incorpora el identificador del coder como criterio de desempate:
+
+```c
+return (base_prio - coder->id);
+```
+
+Esta pequeña diferencia únicamente resuelve empates exactos. El criterio principal sigue siendo el instante de llegada en FIFO o el *deadline* calculado en EDF, mientras que el identificador solo determina el orden cuando ambos valores coinciden.
+
+Gracias a este diseño, la política de planificación queda completamente separada de la implementación del heap: el heap solo necesita comparar prioridades numéricas, sin conocer si la simulación está ejecutándose en modo FIFO o EDF. Esto simplifica la estructura de datos y permite modificar la política de planificación sin cambiar una sola línea del código del heap.
 
 ### 4.5 Cooldown y por qué `calc_timeout` no es un *busy-wait* disfrazado
 
